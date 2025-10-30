@@ -3,3 +3,5 @@ uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 Pillow==10.1.0
 aiofiles==23.2.1
+rarfile==4.1
+py7zr==0.20.8
