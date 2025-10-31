@@ -1,8 +1,10 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import zipfile
+import rarfile
+import py7zr
 import io
 import os
 import shutil
@@ -12,6 +14,7 @@ from pathlib import Path
 import tempfile
 from typing import Optional, Dict, List
 import logging
+import asyncio
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -32,14 +35,57 @@ app.add_middleware(
 TEMP_DIR = Path(tempfile.gettempdir()) / "texture_optimizer"
 TEMP_DIR.mkdir(exist_ok=True)
 
+# Supported archive formats
+SUPPORTED_FORMATS = ['.zip', '.rar', '.7z', '.tar', '.gz']
+
+
+def cleanup_temp_files(*files):
+    """Cleanup temporary files"""
+    for file_path in files:
+        try:
+            if file_path and file_path.exists():
+                if file_path.is_file():
+                    file_path.unlink()
+                elif file_path.is_dir():
+                    shutil.rmtree(file_path, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Error cleaning up {file_path}: {e}")
+
+
+def extract_archive(archive_path: Path, extract_dir: Path) -> bool:
+    """Extract berbagai format archive dengan better error handling"""
+    try:
+        ext = archive_path.suffix.lower()
+        logger.info(f"Extracting {ext} archive...")
+        
+        if ext == '.zip':
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+        elif ext == '.rar':
+            with rarfile.RarFile(archive_path, 'r') as rar_ref:
+                rar_ref.extractall(extract_dir)
+        elif ext == '.7z':
+            with py7zr.SevenZipFile(archive_path, 'r') as seven_ref:
+                seven_ref.extractall(extract_dir)
+        else:
+            logger.error(f"Unsupported archive format: {ext}")
+            return False
+        
+        logger.info(f"Extracted {ext} successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error extracting archive: {str(e)}")
+        return False
+
 
 def optimize_png(image_path: Path, quality: int = 85, max_size: Optional[int] = None) -> int:
-    """Optimize PNG file dengan compression dan optional resize"""
+    """Optimize PNG with better memory management"""
     try:
         original_size = image_path.stat().st_size
         
         with Image.open(image_path) as img:
-            # Convert RGBA jika perlu
+            # Convert RGBA if needed
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGBA', img.size, (255, 255, 255, 0))
                 if img.mode == 'P':
@@ -47,13 +93,13 @@ def optimize_png(image_path: Path, quality: int = 85, max_size: Optional[int] = 
                 background.paste(img, mask=img.split()[-1] if len(img.split()) > 3 else None)
                 img = background
             
-            # Resize jika diminta
+            # Resize if requested
             if max_size and max(img.size) > max_size:
                 ratio = max_size / max(img.size)
                 new_size = tuple(int(dim * ratio) for dim in img.size)
                 img = img.resize(new_size, Image.Resampling.LANCZOS)
             
-            # Save dengan optimization
+            # Save with optimization
             img.save(
                 image_path,
                 "PNG",
@@ -64,23 +110,22 @@ def optimize_png(image_path: Path, quality: int = 85, max_size: Optional[int] = 
         
         new_size = image_path.stat().st_size
         saved = original_size - new_size
-        logger.info(f"Optimized PNG: {image_path.name} (saved {saved} bytes)")
-        return saved
+        return max(saved, 0)
         
     except Exception as e:
-        logger.error(f"Error optimizing PNG {image_path}: {str(e)}")
+        logger.error(f"Error optimizing PNG {image_path.name}: {str(e)}")
         return 0
 
 
 def optimize_json(json_path: Path) -> int:
-    """Minify JSON files by removing whitespace and comments"""
+    """Minify JSON files"""
     try:
         original_size = json_path.stat().st_size
         
         with open(json_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # Remove comments (// and /* */)
+        # Remove comments
         content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
         content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
         
@@ -94,28 +139,25 @@ def optimize_json(json_path: Path) -> int:
             
             new_size = json_path.stat().st_size
             saved = original_size - new_size
-            logger.info(f"Optimized JSON: {json_path.name} (saved {saved} bytes)")
-            return saved
+            return max(saved, 0)
         except json.JSONDecodeError:
             logger.warning(f"Invalid JSON, skipping: {json_path.name}")
             return 0
             
     except Exception as e:
-        logger.error(f"Error optimizing JSON {json_path}: {str(e)}")
+        logger.error(f"Error optimizing JSON {json_path.name}: {str(e)}")
         return 0
 
 
 def optimize_ogg(ogg_path: Path) -> int:
-    """Optimize OGG audio files (basic optimization by removing metadata)"""
+    """Optimize OGG audio files"""
     try:
         original_size = ogg_path.stat().st_size
         
-        # Read file
         with open(ogg_path, 'rb') as f:
             data = f.read()
         
-        # Basic optimization: remove trailing zeros and unnecessary metadata
-        # This is a simple optimization - for advanced, would need pydub/ffmpeg
+        # Remove trailing zeros
         data = data.rstrip(b'\x00')
         
         with open(ogg_path, 'wb') as f:
@@ -123,37 +165,31 @@ def optimize_ogg(ogg_path: Path) -> int:
         
         new_size = ogg_path.stat().st_size
         saved = original_size - new_size
-        
-        if saved > 0:
-            logger.info(f"Optimized OGG: {ogg_path.name} (saved {saved} bytes)")
-        return saved
+        return max(saved, 0)
         
     except Exception as e:
-        logger.error(f"Error optimizing OGG {ogg_path}: {str(e)}")
+        logger.error(f"Error optimizing OGG {ogg_path.name}: {str(e)}")
         return 0
 
 
-def optimize_vfx_shader(shader_path: Path) -> int:
-    """Optimize shader files (.vsh, .fsh, .vfx) by removing comments and whitespace"""
+def optimize_shader(shader_path: Path) -> int:
+    """Optimize shader files"""
     try:
         original_size = shader_path.stat().st_size
         
         with open(shader_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
         
-        # Remove single-line comments
+        # Remove comments
         content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
-        
-        # Remove multi-line comments
         content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
         
-        # Remove excessive whitespace but keep single spaces and newlines for readability
+        # Optimize whitespace
         lines = content.split('\n')
         optimized_lines = []
         for line in lines:
             line = line.strip()
-            if line:  # Keep non-empty lines
-                # Reduce multiple spaces to single space
+            if line:
                 line = re.sub(r'\s+', ' ', line)
                 optimized_lines.append(line)
         
@@ -164,18 +200,15 @@ def optimize_vfx_shader(shader_path: Path) -> int:
         
         new_size = shader_path.stat().st_size
         saved = original_size - new_size
-        
-        if saved > 0:
-            logger.info(f"Optimized Shader: {shader_path.name} (saved {saved} bytes)")
-        return saved
+        return max(saved, 0)
         
     except Exception as e:
-        logger.error(f"Error optimizing shader {shader_path}: {str(e)}")
+        logger.error(f"Error optimizing shader {shader_path.name}: {str(e)}")
         return 0
 
 
-def process_texture_pack(zip_path: Path, output_path: Path, quality: int, max_size: Optional[int]) -> Dict:
-    """Process texture pack ZIP file with comprehensive optimization"""
+def process_texture_pack(archive_path: Path, output_path: Path, quality: int, max_size: Optional[int]) -> Dict:
+    """Process texture pack with improved performance"""
     stats = {
         "total_files": 0,
         "optimized_files": 0,
@@ -192,20 +225,17 @@ def process_texture_pack(zip_path: Path, output_path: Path, quality: int, max_si
         "errors": []
     }
     
-    extract_dir = TEMP_DIR / f"extract_{zip_path.stem}"
+    extract_dir = TEMP_DIR / f"extract_{archive_path.stem}"
     extract_dir.mkdir(exist_ok=True)
     
     try:
-        # Extract ZIP
-        logger.info("Extracting ZIP file...")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
+        # Extract archive
+        if not extract_archive(archive_path, extract_dir):
+            raise Exception(f"Failed to extract {archive_path.suffix} file")
         
         # Calculate original size
-        original_size = 0
-        for f in extract_dir.rglob('*'):
-            if f.is_file():
-                original_size += f.stat().st_size
+        logger.info("Calculating original size...")
+        original_size = sum(f.stat().st_size for f in extract_dir.rglob('*') if f.is_file())
         stats["original_size"] = original_size
         
         # Process PNG files
@@ -213,7 +243,9 @@ def process_texture_pack(zip_path: Path, output_path: Path, quality: int, max_si
         png_files = list(extract_dir.rglob('*.png'))
         stats["file_types"]["png"]["count"] = len(png_files)
         
-        for png_file in png_files:
+        for i, png_file in enumerate(png_files):
+            if i % 50 == 0:
+                logger.info(f"PNG: {i}/{len(png_files)}")
             saved = optimize_png(png_file, quality, max_size)
             if saved > 0:
                 stats["file_types"]["png"]["optimized"] += 1
@@ -232,8 +264,8 @@ def process_texture_pack(zip_path: Path, output_path: Path, quality: int, max_si
                 stats["file_types"]["json"]["saved"] += saved
                 stats["optimized_files"] += 1
         
-        # Process OGG audio files
-        logger.info("Processing OGG audio files...")
+        # Process OGG files
+        logger.info("Processing OGG files...")
         ogg_files = list(extract_dir.rglob('*.ogg'))
         stats["file_types"]["ogg"]["count"] = len(ogg_files)
         
@@ -244,7 +276,7 @@ def process_texture_pack(zip_path: Path, output_path: Path, quality: int, max_si
                 stats["file_types"]["ogg"]["saved"] += saved
                 stats["optimized_files"] += 1
         
-        # Process shader files (.vsh, .fsh, .vfx, .glsl)
+        # Process shader files
         logger.info("Processing shader files...")
         shader_extensions = ['*.vsh', '*.fsh', '*.vfx', '*.glsl', '*.vert', '*.frag']
         shader_files = []
@@ -254,7 +286,7 @@ def process_texture_pack(zip_path: Path, output_path: Path, quality: int, max_si
         stats["file_types"]["shader"]["count"] = len(shader_files)
         
         for shader_file in shader_files:
-            saved = optimize_vfx_shader(shader_file)
+            saved = optimize_shader(shader_file)
             if saved > 0:
                 stats["file_types"]["shader"]["optimized"] += 1
                 stats["file_types"]["shader"]["saved"] += saved
@@ -262,44 +294,48 @@ def process_texture_pack(zip_path: Path, output_path: Path, quality: int, max_si
         
         # Count other files
         all_optimized = set(png_files + json_files + ogg_files + shader_files)
-        all_files = set(extract_dir.rglob('*'))
-        other_files = [f for f in all_files if f.is_file() and f not in all_optimized]
+        all_files = [f for f in extract_dir.rglob('*') if f.is_file()]
+        other_files = [f for f in all_files if f not in all_optimized]
         stats["file_types"]["other"]["count"] = len(other_files)
+        stats["total_files"] = len(all_files)
         
-        stats["total_files"] = len([f for f in all_files if f.is_file()])
-        
-        # Calculate total bytes saved
-        stats["bytes_saved"] = (
-            stats["file_types"]["png"]["saved"] +
-            stats["file_types"]["json"]["saved"] +
-            stats["file_types"]["ogg"]["saved"] +
+        # Calculate bytes saved from optimization
+        stats["bytes_saved"] = sum([
+            stats["file_types"]["png"]["saved"],
+            stats["file_types"]["json"]["saved"],
+            stats["file_types"]["ogg"]["saved"],
             stats["file_types"]["shader"]["saved"]
-        )
+        ])
         
-        # Create optimized ZIP with proper compression
+        # Create optimized ZIP
         logger.info("Creating optimized ZIP...")
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zip_out:
-            for file_path in extract_dir.rglob('*'):
-                if file_path.is_file():
-                    arcname = file_path.relative_to(extract_dir)
-                    zip_out.write(file_path, arcname)
+            for i, file_path in enumerate(all_files):
+                if i % 100 == 0:
+                    logger.info(f"Zipping: {i}/{len(all_files)}")
+                arcname = file_path.relative_to(extract_dir)
+                zip_out.write(file_path, arcname)
         
-        # Get final optimized size
+        # Get final size
         stats["optimized_size"] = output_path.stat().st_size
         
-        # Calculate accurate compression ratio
+        # Calculate compression ratio
         if stats["original_size"] > 0:
             actual_reduction = stats["original_size"] - stats["optimized_size"]
             stats["compression_ratio"] = round((actual_reduction / stats["original_size"]) * 100, 2)
+            stats["actual_bytes_saved"] = actual_reduction
         else:
             stats["compression_ratio"] = 0
+            stats["actual_bytes_saved"] = 0
         
-        logger.info(f"Optimization complete! Saved {stats['bytes_saved']} bytes from files, "
-                   f"total reduction: {stats['compression_ratio']}%")
+        logger.info(f"✓ Optimization complete! {stats['compression_ratio']}% reduction")
         
+    except Exception as e:
+        logger.error(f"Error in process_texture_pack: {str(e)}")
+        raise
     finally:
-        # Cleanup extract directory
-        shutil.rmtree(extract_dir, ignore_errors=True)
+        # Cleanup
+        cleanup_temp_files(extract_dir)
     
     return stats
 
@@ -308,106 +344,119 @@ def process_texture_pack(zip_path: Path, output_path: Path, quality: int, max_si
 async def root():
     return {
         "message": "Minecraft Texture Pack Optimizer API",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "status": "operational",
         "features": [
-            "PNG image optimization",
+            "PNG optimization (compression + resize)",
             "JSON minification",
             "OGG audio optimization",
             "Shader optimization (.vsh, .fsh, .vfx, .glsl)",
-            "Accurate size reduction tracking"
+            "Multi-format support (ZIP, RAR, 7Z)",
+            "Fixed download for large files",
+            "Better performance for 20MB+ files"
         ],
-        "endpoints": {
-            "/optimize": "POST - Upload texture pack ZIP for optimization",
-            "/health": "GET - Health check"
-        }
+        "supported_formats": SUPPORTED_FORMATS
     }
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "texture-optimizer", "version": "2.0.0"}
+    return {
+        "status": "healthy",
+        "service": "texture-optimizer",
+        "version": "2.1.0",
+        "temp_dir_writable": os.access(TEMP_DIR, os.W_OK)
+    }
 
 
 @app.post("/optimize")
 async def optimize_texture_pack(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     quality: int = 85,
     max_size: Optional[int] = None
 ):
     """
-    Optimize Minecraft texture pack with comprehensive file type support
-    
-    - **file**: ZIP file texture pack
-    - **quality**: PNG compression quality 1-100 (default: 85)
-    - **max_size**: Maximum texture dimension in pixels (optional)
+    Optimize Minecraft texture pack (v2.1 - Improved for large files)
     
     Supports:
+    - Archive formats: ZIP, RAR, 7Z
     - PNG images (compression + resize)
     - JSON files (minification)
-    - OGG audio files (metadata removal)
-    - Shader files (comment removal, whitespace optimization)
+    - OGG audio (metadata removal)
+    - Shader files (code optimization)
     """
     
-    # Validate file
-    if not file.filename.endswith('.zip'):
-        raise HTTPException(status_code=400, detail="File must be a ZIP archive")
+    # Validate file format
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in SUPPORTED_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format. Supported: {', '.join(SUPPORTED_FORMATS)}"
+        )
     
     # Validate quality
     if not 1 <= quality <= 100:
-        raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
+        raise HTTPException(status_code=400, detail="Quality must be between 1-100")
     
     # Create unique filenames
     import uuid
     unique_id = str(uuid.uuid4())
-    input_path = TEMP_DIR / f"input_{unique_id}.zip"
+    input_path = TEMP_DIR / f"input_{unique_id}{file_ext}"
     output_path = TEMP_DIR / f"optimized_{unique_id}.zip"
     
     try:
         # Save uploaded file
-        logger.info(f"Receiving file: {file.filename}")
+        logger.info(f"Receiving: {file.filename} ({file_ext})")
         content = await file.read()
         input_path.write_bytes(content)
+        logger.info(f"Saved input file: {len(content)} bytes")
         
-        logger.info(f"Processing texture pack: {file.filename}")
-        
-        # Process texture pack
+        # Process
+        logger.info("Starting optimization...")
         stats = process_texture_pack(input_path, output_path, quality, max_size)
         
-        # Prepare detailed stats for response headers
+        # Verify output exists
+        if not output_path.exists():
+            raise Exception("Output file was not created")
+        
+        output_size = output_path.stat().st_size
+        logger.info(f"Output file created: {output_size} bytes")
+        
+        # Prepare stats header
         file_types_json = json.dumps(stats["file_types"])
         
-        logger.info(f"Optimization complete: {stats['compression_ratio']}% reduction")
+        # Prepare filename
+        base_name = Path(file.filename).stem
+        output_filename = f"optimized_{base_name}.zip"
         
-        # Read optimized file
-        optimized_content = output_path.read_bytes()
+        # Schedule cleanup after response is sent
+        background_tasks.add_task(cleanup_temp_files, input_path, output_path)
         
-        # Clean up files
-        input_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
-        
-        # Return file with comprehensive stats
-        return StreamingResponse(
-            io.BytesIO(optimized_content),
+        # Return file using FileResponse (better for large files)
+        return FileResponse(
+            path=output_path,
             media_type="application/zip",
+            filename=output_filename,
             headers={
-                "Content-Disposition": f'attachment; filename="optimized_{file.filename}"',
                 "X-Original-Size": str(stats["original_size"]),
                 "X-Optimized-Size": str(stats["optimized_size"]),
                 "X-Bytes-Saved": str(stats["bytes_saved"]),
+                "X-Actual-Bytes-Saved": str(stats.get("actual_bytes_saved", 0)),
                 "X-Compression-Ratio": str(stats["compression_ratio"]),
                 "X-Total-Files": str(stats["total_files"]),
                 "X-Optimized-Files": str(stats["optimized_files"]),
                 "X-File-Types": file_types_json,
-                "Access-Control-Expose-Headers": "Content-Disposition, X-Original-Size, X-Optimized-Size, X-Bytes-Saved, X-Compression-Ratio, X-Total-Files, X-Optimized-Files, X-File-Types"
+                "Access-Control-Expose-Headers": "X-Original-Size, X-Optimized-Size, X-Bytes-Saved, X-Actual-Bytes-Saved, X-Compression-Ratio, X-Total-Files, X-Optimized-Files, X-File-Types",
+                "Cache-Control": "no-cache"
             }
         )
         
     except Exception as e:
         # Cleanup on error
-        input_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
-        logger.error(f"Error processing texture pack: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing texture pack: {str(e)}")
+        cleanup_temp_files(input_path, output_path)
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 if __name__ == "__main__":
