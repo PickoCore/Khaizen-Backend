@@ -52,31 +52,94 @@ def cleanup_temp_files(*files):
             logger.error(f"Error cleaning up {file_path}: {e}")
 
 
-def extract_archive(archive_path: Path, extract_dir: Path) -> bool:
-    """Extract berbagai format archive dengan better error handling"""
+def extract_archive(archive_path: Path, extract_dir: Path) -> tuple[bool, str]:
+    """Extract berbagai format archive dengan comprehensive error handling"""
     try:
         ext = archive_path.suffix.lower()
         logger.info(f"Extracting {ext} archive...")
         
-        if ext == '.zip':
-            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
-        elif ext == '.rar':
-            with rarfile.RarFile(archive_path, 'r') as rar_ref:
-                rar_ref.extractall(extract_dir)
-        elif ext == '.7z':
-            with py7zr.SevenZipFile(archive_path, 'r') as seven_ref:
-                seven_ref.extractall(extract_dir)
-        else:
-            logger.error(f"Unsupported archive format: {ext}")
-            return False
+        # Verify file exists and is readable
+        if not archive_path.exists():
+            return False, "Archive file not found"
         
-        logger.info(f"Extracted {ext} successfully")
-        return True
+        if archive_path.stat().st_size == 0:
+            return False, "Archive file is empty"
+        
+        if ext == '.zip':
+            # Validate ZIP first
+            if not zipfile.is_zipfile(archive_path):
+                return False, "File is not a valid ZIP archive"
+            
+            try:
+                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    # Test ZIP integrity first
+                    bad_file = zip_ref.testzip()
+                    if bad_file:
+                        return False, f"Corrupted file in ZIP: {bad_file}"
+                    
+                    # Check if password protected
+                    for zinfo in zip_ref.filelist:
+                        if zinfo.flag_bits & 0x1:
+                            return False, "Password-protected ZIP files are not supported"
+                    
+                    # Extract all files
+                    zip_ref.extractall(extract_dir)
+                    
+            except zipfile.BadZipFile:
+                return False, "Invalid or corrupted ZIP file"
+            except RuntimeError as e:
+                if 'password' in str(e).lower():
+                    return False, "Password-protected ZIP files are not supported"
+                return False, f"ZIP extraction error: {str(e)}"
+                
+        elif ext == '.rar':
+            try:
+                with rarfile.RarFile(archive_path, 'r') as rar_ref:
+                    # Check if password protected
+                    if rar_ref.needs_password():
+                        return False, "Password-protected RAR files are not supported"
+                    
+                    # Test RAR integrity
+                    rar_ref.testrar()
+                    
+                    # Extract all files
+                    rar_ref.extractall(extract_dir)
+                    
+            except rarfile.BadRarFile:
+                return False, "Invalid or corrupted RAR file"
+            except rarfile.PasswordRequired:
+                return False, "Password-protected RAR files are not supported"
+            except Exception as e:
+                return False, f"RAR extraction error: {str(e)}"
+                
+        elif ext == '.7z':
+            try:
+                with py7zr.SevenZipFile(archive_path, 'r') as seven_ref:
+                    # Check if password protected
+                    if seven_ref.needs_password():
+                        return False, "Password-protected 7Z files are not supported"
+                    
+                    # Extract all files
+                    seven_ref.extractall(extract_dir)
+                    
+            except py7zr.Bad7zFile:
+                return False, "Invalid or corrupted 7Z file"
+            except Exception as e:
+                return False, f"7Z extraction error: {str(e)}"
+        else:
+            return False, f"Unsupported archive format: {ext}"
+        
+        # Verify extraction was successful
+        extracted_files = list(extract_dir.rglob('*'))
+        if not extracted_files:
+            return False, "Archive is empty or extraction failed"
+        
+        logger.info(f"Successfully extracted {len(extracted_files)} items from {ext}")
+        return True, "Success"
         
     except Exception as e:
-        logger.error(f"Error extracting archive: {str(e)}")
-        return False
+        logger.error(f"Unexpected error extracting archive: {str(e)}")
+        return False, f"Extraction failed: {str(e)}"
 
 
 def optimize_png(image_path: Path, quality: int = 85, max_size: Optional[int] = None) -> int:
@@ -230,8 +293,9 @@ def process_texture_pack(archive_path: Path, output_path: Path, quality: int, ma
     
     try:
         # Extract archive
-        if not extract_archive(archive_path, extract_dir):
-            raise Exception(f"Failed to extract {archive_path.suffix} file")
+        success, message = extract_archive(archive_path, extract_dir)
+        if not success:
+            raise Exception(f"Extraction failed: {message}")
         
         # Calculate original size
         logger.info("Calculating original size...")
@@ -369,6 +433,63 @@ async def health_check():
     }
 
 
+@app.post("/validate")
+async def validate_archive(file: UploadFile = File(...)):
+    """
+    Validate archive file before optimization
+    Quick check to ensure file is valid
+    """
+    file_ext = Path(file.filename).suffix.lower()
+    
+    if file_ext not in SUPPORTED_FORMATS:
+        return {
+            "valid": False,
+            "error": f"Unsupported format. Supported: {', '.join(SUPPORTED_FORMATS)}"
+        }
+    
+    try:
+        content = await file.read()
+        
+        if len(content) == 0:
+            return {"valid": False, "error": "File is empty"}
+        
+        if len(content) > 100 * 1024 * 1024:
+            return {"valid": False, "error": "File too large (max 100MB)"}
+        
+        # Quick validation
+        temp_path = TEMP_DIR / f"validate_{file.filename}"
+        temp_path.write_bytes(content)
+        
+        try:
+            if file_ext == '.zip':
+                if not zipfile.is_zipfile(temp_path):
+                    return {"valid": False, "error": "Not a valid ZIP file"}
+                with zipfile.ZipFile(temp_path, 'r') as zf:
+                    bad = zf.testzip()
+                    if bad:
+                        return {"valid": False, "error": f"Corrupted file: {bad}"}
+            elif file_ext == '.rar':
+                with rarfile.RarFile(temp_path, 'r') as rf:
+                    if rf.needs_password():
+                        return {"valid": False, "error": "Password-protected RAR not supported"}
+            elif file_ext == '.7z':
+                with py7zr.SevenZipFile(temp_path, 'r') as sf:
+                    if sf.needs_password():
+                        return {"valid": False, "error": "Password-protected 7Z not supported"}
+            
+            return {
+                "valid": True,
+                "filename": file.filename,
+                "size": len(content),
+                "format": file_ext
+            }
+        finally:
+            temp_path.unlink(missing_ok=True)
+            
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
 @app.post("/optimize")
 async def optimize_texture_pack(
     background_tasks: BackgroundTasks,
@@ -409,8 +530,41 @@ async def optimize_texture_pack(
         # Save uploaded file
         logger.info(f"Receiving: {file.filename} ({file_ext})")
         content = await file.read()
+        
+        # Validate file size
+        if len(content) == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        
+        if len(content) > 100 * 1024 * 1024:  # 100MB limit
+            raise HTTPException(status_code=400, detail="File too large (max 100MB)")
+        
         input_path.write_bytes(content)
         logger.info(f"Saved input file: {len(content)} bytes")
+        
+        # Validate archive integrity before processing
+        ext = file_ext
+        try:
+            if ext == '.zip':
+                if not zipfile.is_zipfile(input_path):
+                    raise HTTPException(status_code=400, detail="File is not a valid ZIP archive. Please check if the file is corrupted.")
+            elif ext == '.rar':
+                with rarfile.RarFile(input_path, 'r') as rar:
+                    pass  # Just test opening
+            elif ext == '.7z':
+                with py7zr.SevenZipFile(input_path, 'r') as seven:
+                    pass  # Just test opening
+        except zipfile.BadZipFile:
+            cleanup_temp_files(input_path)
+            raise HTTPException(status_code=400, detail="Invalid or corrupted ZIP file. Please re-download/re-create your texture pack.")
+        except rarfile.BadRarFile:
+            cleanup_temp_files(input_path)
+            raise HTTPException(status_code=400, detail="Invalid or corrupted RAR file.")
+        except py7zr.Bad7zFile:
+            cleanup_temp_files(input_path)
+            raise HTTPException(status_code=400, detail="Invalid or corrupted 7Z file.")
+        except Exception as e:
+            cleanup_temp_files(input_path)
+            raise HTTPException(status_code=400, detail=f"Cannot read archive: {str(e)}")
         
         # Process
         logger.info("Starting optimization...")
